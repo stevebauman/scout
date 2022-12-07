@@ -4,6 +4,7 @@ namespace Laravel\Scout;
 
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Collection as BaseCollection;
+use Illuminate\Support\Str;
 
 trait Searchable
 {
@@ -99,6 +100,16 @@ trait Searchable
     }
 
     /**
+     * When updating a model, this method determines if we should update the search index.
+     *
+     * @return bool
+     */
+    public function searchIndexShouldBeUpdated()
+    {
+        return true;
+    }
+
+    /**
      * Perform a search against the model's indexed data.
      *
      * @param  string  $query
@@ -182,6 +193,26 @@ trait Searchable
     }
 
     /**
+     * Determine if the model existed in the search index prior to an update.
+     *
+     * @return bool
+     */
+    public function wasSearchableBeforeUpdate()
+    {
+        return true;
+    }
+
+    /**
+     * Determine if the model existed in the search index prior to deletion.
+     *
+     * @return bool
+     */
+    public function wasSearchableBeforeDelete()
+    {
+        return true;
+    }
+
+    /**
      * Get the requested models from an array of object IDs.
      *
      * @param  \Laravel\Scout\Builder  $builder
@@ -209,7 +240,11 @@ trait Searchable
             call_user_func($builder->queryCallback, $query);
         }
 
-        return $query->whereIn(
+        $whereIn = in_array($this->getKeyType(), ['int', 'integer']) ?
+            'whereIntegerInRaw' :
+            'whereIn';
+
+        return $query->{$whereIn}(
             $this->getScoutKeyName(), $ids
         );
     }
@@ -353,6 +388,16 @@ trait Searchable
     public function getScoutKeyName()
     {
         return $this->getQualifiedKeyName();
+    }
+
+    /**
+     * Get the unqualified Scout key name.
+     *
+     * @return string
+     */
+    public function getUnqualifiedScoutKeyName()
+    {
+        return Str::afterLast($this->getScoutKeyName(), '.');
     }
 
     /**

@@ -4,7 +4,9 @@ namespace Laravel\Scout\Engines;
 
 use Illuminate\Support\LazyCollection;
 use Laravel\Scout\Builder;
-use MeiliSearch\Client as MeiliSearch;
+use Laravel\Scout\Jobs\RemoveableScoutCollection;
+use MeiliSearch\Client as MeiliSearchClient;
+use MeiliSearch\MeiliSearch;
 use MeiliSearch\Search\SearchResult;
 
 class MeiliSearchEngine extends Engine
@@ -30,7 +32,7 @@ class MeiliSearchEngine extends Engine
      * @param  bool  $softDelete
      * @return void
      */
-    public function __construct(MeiliSearch $meilisearch, $softDelete = false)
+    public function __construct(MeiliSearchClient $meilisearch, $softDelete = false)
     {
         $this->meilisearch = $meilisearch;
         $this->softDelete = $softDelete;
@@ -61,7 +63,11 @@ class MeiliSearchEngine extends Engine
                 return;
             }
 
-            return array_merge($searchableData, $model->scoutMetadata());
+            return array_merge(
+                $searchableData,
+                $model->scoutMetadata(),
+                [$model->getKeyName() => $model->getScoutKey()],
+            );
         })->filter()->values()->all();
 
         if (! empty($objects)) {
@@ -77,13 +83,17 @@ class MeiliSearchEngine extends Engine
      */
     public function delete($models)
     {
+        if ($models->isEmpty()) {
+            return;
+        }
+
         $index = $this->meilisearch->index($models->first()->searchableAs());
 
-        $index->deleteDocuments(
-            $models->map->getScoutKey()
-                ->values()
-                ->all()
-        );
+        $keys = $models instanceof RemoveableScoutCollection
+            ? $models->pluck($models->first()->getUnqualifiedScoutKeyName())
+            : $models->map->getScoutKey();
+
+        $index->deleteDocuments($keys->all());
     }
 
     /**
@@ -96,6 +106,7 @@ class MeiliSearchEngine extends Engine
         return $this->performSearch($builder, array_filter([
             'filters' => $this->filters($builder),
             'limit' => $builder->limit,
+            'sort' => $this->buildSortFromOrderByClauses($builder),
         ]));
     }
 
@@ -112,6 +123,7 @@ class MeiliSearchEngine extends Engine
             'filters' => $this->filters($builder),
             'limit' => (int) $perPage,
             'offset' => ($page - 1) * $perPage,
+            'sort' => $this->buildSortFromOrderByClauses($builder),
         ]));
     }
 
@@ -125,6 +137,13 @@ class MeiliSearchEngine extends Engine
     protected function performSearch(Builder $builder, array $searchParams = [])
     {
         $meilisearch = $this->meilisearch->index($builder->index ?: $builder->model->searchableAs());
+
+        // meilisearch-php 0.19.0 is compatible with meilisearch server 0.21.0...
+        if (version_compare(MeiliSearch::VERSION, '0.19.0') >= 0 && isset($searchParams['filters'])) {
+            $searchParams['filter'] = $searchParams['filters'];
+
+            unset($searchParams['filters']);
+        }
 
         if ($builder->callback) {
             $result = call_user_func(
@@ -148,13 +167,48 @@ class MeiliSearchEngine extends Engine
      */
     protected function filters(Builder $builder)
     {
-        return collect($builder->wheres)->map(function ($value, $key) {
-            return sprintf('%s="%s"', $key, $value);
-        })->values()->implode(' AND ');
+        $filters = collect($builder->wheres)->map(function ($value, $key) {
+            if (is_bool($value)) {
+                return sprintf('%s=%s', $key, $value ? 'true' : 'false');
+            }
+
+            return is_numeric($value)
+                            ? sprintf('%s=%s', $key, $value)
+                            : sprintf('%s="%s"', $key, $value);
+        });
+
+        foreach ($builder->whereIns as $key => $values) {
+            $filters->push(sprintf('(%s)', collect($values)->map(function ($value) use ($key) {
+                if (is_bool($value)) {
+                    return sprintf('%s=%s', $key, $value ? 'true' : 'false');
+                }
+
+                return filter_var($value, FILTER_VALIDATE_INT) !== false
+                                ? sprintf('%s=%s', $key, $value)
+                                : sprintf('%s="%s"', $key, $value);
+            })->values()->implode(' OR ')));
+        }
+
+        return $filters->values()->implode(' AND ');
+    }
+
+    /**
+     * Get the sort array for the query.
+     *
+     * @param  \Laravel\Scout\Builder  $builder
+     * @return array
+     */
+    protected function buildSortFromOrderByClauses(Builder $builder): array
+    {
+        return collect($builder->orders)->map(function (array $order) {
+            return $order['column'].':'.$order['direction'];
+        })->toArray();
     }
 
     /**
      * Pluck and return the primary keys of the given results.
+     *
+     * This expects the first item of each search item array to be the primary key.
      *
      * @param  mixed  $results
      * @return \Illuminate\Support\Collection
@@ -166,9 +220,37 @@ class MeiliSearchEngine extends Engine
         }
 
         $hits = collect($results['hits']);
+
         $key = key($hits->first());
 
         return $hits->pluck($key)->values();
+    }
+
+    /**
+     * Pluck and the given results with the given primary key name.
+     *
+     * @param  mixed  $results
+     * @param  string  $key
+     * @return \Illuminate\Support\Collection
+     */
+    public function mapIdsFrom($results, $key)
+    {
+        return count($results['hits']) === 0
+                ? collect()
+                : collect($results['hits'])->pluck($key)->values();
+    }
+
+    /**
+     * Get the results of the query as a Collection of primary keys.
+     *
+     * @param  \Laravel\Scout\Builder  $builder
+     * @return \Illuminate\Support\Collection
+     */
+    public function keys(Builder $builder)
+    {
+        $scoutKey = $builder->model->getUnqualifiedScoutKeyName();
+
+        return $this->mapIdsFrom($this->search($builder), $scoutKey);
     }
 
     /**
@@ -199,7 +281,7 @@ class MeiliSearchEngine extends Engine
     }
 
     /**
-     * Map the given results to instances of the given modell via a lazy collection.
+     * Map the given results to instances of the given model via a lazy collection.
      *
      * @param  \Laravel\Scout\Builder  $builder
      * @param  mixed  $results
@@ -260,6 +342,20 @@ class MeiliSearchEngine extends Engine
     public function createIndex($name, array $options = [])
     {
         return $this->meilisearch->createIndex($name, $options);
+    }
+
+    /**
+     * Update an index's settings.
+     *
+     * @param  string  $name
+     * @param  array  $options
+     * @return array
+     *
+     * @throws \MeiliSearch\Exceptions\ApiException
+     */
+    public function updateIndexSettings($name, array $options = [])
+    {
+        return $this->meilisearch->index($name)->updateSettings($options);
     }
 
     /**

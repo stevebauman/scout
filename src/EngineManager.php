@@ -8,6 +8,8 @@ use Algolia\AlgoliaSearch\Support\UserAgent;
 use Exception;
 use Illuminate\Support\Manager;
 use Laravel\Scout\Engines\AlgoliaEngine;
+use Laravel\Scout\Engines\CollectionEngine;
+use Laravel\Scout\Engines\DatabaseEngine;
 use Laravel\Scout\Engines\MeiliSearchEngine;
 use Laravel\Scout\Engines\NullEngine;
 use MeiliSearch\Client as MeiliSearch;
@@ -34,7 +36,7 @@ class EngineManager extends Manager
     {
         $this->ensureAlgoliaClientIsInstalled();
 
-        UserAgent::addCustomUserAgent('Laravel Scout', '9.1.1');
+        UserAgent::addCustomUserAgent('Laravel Scout', '9.5.0');
 
         $config = SearchConfig::create(
             config('scout.algolia.id'),
@@ -42,6 +44,18 @@ class EngineManager extends Manager
         )->setDefaultHeaders(
             $this->defaultAlgoliaHeaders()
         );
+
+        if (is_int($connectTimeout = config('scout.algolia.connect_timeout'))) {
+            $config->setConnectTimeout($connectTimeout);
+        }
+
+        if (is_int($readTimeout = config('scout.algolia.read_timeout'))) {
+            $config->setReadTimeout($readTimeout);
+        }
+
+        if (is_int($writeTimeout = config('scout.algolia.write_timeout'))) {
+            $config->setWriteTimeout($writeTimeout);
+        }
 
         return new AlgoliaEngine(Algolia::createWithConfig($config), config('scout.soft_delete'));
     }
@@ -124,7 +138,27 @@ class EngineManager extends Manager
     }
 
     /**
-     * Create a Null engine instance.
+     * Create a database engine instance.
+     *
+     * @return \Laravel\Scout\Engines\DatabaseEngine
+     */
+    public function createDatabaseDriver()
+    {
+        return new DatabaseEngine;
+    }
+
+    /**
+     * Create a collection engine instance.
+     *
+     * @return \Laravel\Scout\Engines\CollectionEngine
+     */
+    public function createCollectionDriver()
+    {
+        return new CollectionEngine;
+    }
+
+    /**
+     * Create a null engine instance.
      *
      * @return \Laravel\Scout\Engines\NullEngine
      */
